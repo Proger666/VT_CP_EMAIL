@@ -275,7 +275,9 @@ SECONDS_TO_WAIT = 5
 
 
 def move_file_per_verdict(self, verdict):
-    if verdict['severity'] == 4:  # critical
+    if verdict['severity'] is None:
+        return
+    if verdict['severity'] >= 4:  # critical
         os.rename(self.file_path, self.output_folder + '\high\\' + self.file_name)
     if verdict['severity'] == 3:
         os.rename(self.file_path, self.output_folder + '\medium\\' + self.file_name)
