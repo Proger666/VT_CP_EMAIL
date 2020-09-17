@@ -58,12 +58,12 @@ LOCAL_STORE = 'SAMPLEFILES'
 
 socket.setdefaulttimeout(60)
 
-LOGGING_LEVEL = logging.DEBUG  # Modify if you just want to focus on errors
+LOGGING_LEVEL = logging.INFO  # Modify if you just want to focus on errors
 logging.basicConfig(level=LOGGING_LEVEL,
                     format='%(asctime)s %(levelname)-8s %(message)s',
                     datefmt='%Y-%m-%d %H:%M:%S',
                     stream=sys.stdout)
-time = time.strftime('%Y%m%dT%H%M%S')
+f_global_time  = time.strftime('%Y%m%dT%H%M%S')
 
 class Error(Exception):
     """Base-class for exceptions in this module."""
@@ -87,7 +87,7 @@ def create_download_folder(query=None):
     Returns:
       String with the path of the created folder.
     """
-    folder_name = time
+    folder_name = f_global_time
     if not os.path.exists(LOCAL_STORE):
         os.mkdir(LOCAL_STORE)
     folder_path = os.path.join(LOCAL_STORE, folder_name)
@@ -536,7 +536,7 @@ def te_worker(te_work):
 
 def send_to_sandbox(folder, te_ip='te.checkpoint.com', TE_API_KEY=None, images=None):
     files_to_check = os.listdir(folder)
-    te_response_folder = "TE_FOLDER_" + time
+    te_response_folder = "TE_FOLDER_" + f_global_time
 
     url = "https://{}/tecloud/api/v1/file/".format(te_ip)
     te_work = queue.Queue()  # Queues files to SB
