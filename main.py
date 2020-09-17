@@ -445,7 +445,7 @@ class TE(object):
                 self.attempts = 0
                 return True
             logging.info("Pending request")
-            self.attempts +=1
+            self.attempts += 1
             return False
         else:
             logging.error(
@@ -475,7 +475,11 @@ class TE(object):
             }
         }
         data = json.dumps(request)
-        file = open(self.file_path, 'rb')
+        try:
+            file = open(self.file_path, 'rb')
+        except:
+            logging.error("File not found {}".format(self.file_name))
+            return False
         if get_file_size(file) / 1024 / 1024 > 25:
             logging.error("File too large {}".format(self.file_name))
             return False
