@@ -52,7 +52,7 @@ INTELLIGENCE_SEARCH_URL = ('https://www.virustotal.com/intelligence/search/'
 INTELLIGENCE_DOWNLOAD_URL = ('https://www.virustotal.com/intelligence/download/'
                              '?hash=%s&apikey=%s')
 
-NUM_CONCURRENT_DOWNLOADS = 1
+NUM_CONCURRENT_DOWNLOADS = 10
 
 LOCAL_STORE = 'SAMPLEFILES'
 
@@ -287,14 +287,14 @@ def parse_file_verdict(response):
     """
     try:
         verdict = {'verdict': response["response"][0]["te"]["combined_verdict"],
-                   'severity': response["response"][0]["te"]['severity']
+                   'severity': response["response"][0]["te"].get('severity', None)
                    }
-        logging.info("te verdict is: {} for file {}".format(verdict, response['response'][0]['sha256']))
+        logging.info("te verdict is: {} for file {}".format(verdict, response['response']))
 
     except:
         verdict = {'verdict': response["response"]["te"]["combined_verdict"],
                    'severity': response["response"]["te"].get('severity', None)}
-        logging.info("te verdict is: {} for file {}".format(verdict, response['response']['sha256']))
+        logging.info("te verdict is: {} for file {}".format(verdict, response['response']))
 
     return verdict
 
