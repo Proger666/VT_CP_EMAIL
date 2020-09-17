@@ -52,13 +52,13 @@ INTELLIGENCE_SEARCH_URL = ('https://www.virustotal.com/intelligence/search/'
 INTELLIGENCE_DOWNLOAD_URL = ('https://www.virustotal.com/intelligence/download/'
                              '?hash=%s&apikey=%s')
 
-NUM_CONCURRENT_DOWNLOADS = 5
+NUM_CONCURRENT_DOWNLOADS = 1
 
 LOCAL_STORE = 'SAMPLEFILES'
 
 socket.setdefaulttimeout(60)
 
-LOGGING_LEVEL = logging.INFO  # Modify if you just want to focus on errors
+LOGGING_LEVEL = logging.DEBUG  # Modify if you just want to focus on errors
 logging.basicConfig(level=LOGGING_LEVEL,
                     format='%(asctime)s %(levelname)-8s %(message)s',
                     datefmt='%Y-%m-%d %H:%M:%S',
@@ -328,14 +328,15 @@ class TE(object):
     Notice that if TE should run separately, a separate parsing response method should be added.
     """
 
-    def __init__(self, url, file_name, file_path, output_folder, TE_API_KEY):
-        self.images = None  # default win10 & win8
-        # self.images = ['winXP' , 'win8', 'win10']
+    def __init__(self, url, file_name, file_path, output_folder, TE_API_KEY, images):
+        self.images = None
+        self.attempts = 0
         self.url = url
         self.file_name = file_name
         self.file_path = file_path
         self.upload_request = {"request": [{"features": ["te"]}]}
-        self.query_request = {"request": [{"sha1": "", "features": ["te"]}]}
+        self.query_request = {
+            "request": [{"sha1": "", "features": ["te"], "te": {"images": []}, "reports": ['summary']}]}
         self.output_folder = output_folder
         self.sha1 = ""
         self.TE_API_KEY = TE_API_KEY
@@ -357,6 +358,7 @@ class TE(object):
         """
         request = self.query_request
         request['request'][0]['sha1'] = self.sha1
+        request['request'][0]['te']['images'] = self.images
         data = json.dumps(request)
         response_j = json.loads('{}')
         label = False
@@ -376,9 +378,10 @@ class TE(object):
         """
         request = self.upload_request
         data = json.dumps(request)
+        file = open(self.file_path, 'rb')
         curr_file = {
             'request': data,
-            'file': open(self.file_path, 'rb')
+            'file': file
         }
         logging.debug("Sending TE Upload request")
         response = requests.post(url=self.url + "upload", files=curr_file, verify=False, headers=self.headers)
@@ -393,7 +396,7 @@ class TE(object):
            Otherwise, exit
         3. Save the upload/query response of found result in a file in the relevant folder
         """
-        upload_response = self.upload_file() if self.TE_API_KEY is None else self.upload_file_cloud()
+        upload_response = self.upload_file()
         logging.debug("Receiving TE Upload response")
         logging.info("Upload result: {}".format(upload_response["response"][0]["te"]["status"]["label"]))
         upload_return_code = upload_response["response"][0]["te"]["status"]["code"]
@@ -422,7 +425,9 @@ class TE(object):
            Otherwise, exit
         3. Save the upload/query response of found result in a file in the relevant folder
         """
-        upload_response = self.upload_file() if self.TE_API_KEY is None else self.upload_file_cloud()
+        upload_response = self.upload_file_cloud()
+        if not upload_response:
+            return True
         logging.debug("Receiving TE Upload response")
         logging.info("Upload result: {}".format(upload_response["response"]["te"]["status"]["label"]))
         upload_return_code = upload_response["response"]["te"]["status"]["code"]
@@ -435,6 +440,12 @@ class TE(object):
         elif upload_return_code == 1001:
             query_response = upload_response
         elif upload_return_code == 1003:
+            if self.attempts > 10:
+                logging.error("Failed to upload file {}".format(self.file_name))
+                self.attempts = 0
+                return True
+            logging.info("Pending request")
+            self.attempts +=1
             return False
         else:
             logging.error(
@@ -446,37 +457,41 @@ class TE(object):
         return True
 
     def upload_file_cloud(self):
-        '''Will use xp and Win 10 as images and upload to cloud'''
+        '''Will Win 10 as images and upload to cloud'''
         if self.images is None:
-            images = [{
+            self.images = [{
                 "id": "10b4a9c6-e414-425c-ae8b-fe4dd7b25244",
                 "revision": 1
-            },
-                {
-                    "id": 'e50e99f3-5963-4573-af9ee3f4750b55e2',
-                    "revision": 1
-                }]
-        else:
-            images = resolve_images_from_name(self.images)
+            }]
         request = {
             "request": {
                 "file_name": self.file_name,
                 "file_type": "",
                 "features": ["te"],
                 "te": {
-                    "images": images,
+                    "images": self.images,
                     "reports": ["summary"]
                 }
             }
         }
         data = json.dumps(request)
+        file = open(self.file_path, 'rb')
+        if get_file_size(file) / 1024 / 1024 > 25:
+            logging.error("File too large {}".format(self.file_name))
+            return False
+
         curr_file = {
             'request': data,
-            'file': open(self.file_path, 'rb')
+            'file': file
         }
+
         logging.debug("Sending TE Upload request")
-        response = requests.post(url=self.url + "upload", files=curr_file, verify=False, headers=self.headers)
-        response_j = response.json()
+        try:
+            response = requests.post(url=self.url + "upload", files=curr_file, verify=False, headers=self.headers)
+            response_j = response.json()
+        except Exception as e:
+            logging.error("Failed to process file {}".format(self.file_name))
+            return False
         return response_j
 
 
@@ -493,13 +508,13 @@ def create_out_folder(output_folder):
 def te_worker(te_work):
     while True:
         try:
-            url, file, file_path, te_work, te_response_folder, TE_API_KEY = te_work.get(True, 3)
+            url, file, file_path, te_work, te_response_folder, TE_API_KEY, images = te_work.get(True, 3)
         except queue.Empty:
             break
 
         logging.info('Processing file %s', file)
 
-        te = TE(url, file, file_path, te_response_folder, TE_API_KEY)
+        te = TE(url, file, file_path, te_response_folder, TE_API_KEY, images)
 
         if TE_API_KEY is None:
             te.handle_file()
@@ -507,14 +522,15 @@ def te_worker(te_work):
             cloud_result = False
             while not cloud_result:
                 cloud_result = te.handle_file_cloud()
-                time.sleep(3)
+                time.sleep(2)
+
         logging.info('File analyzed %s', file)
     te_work.task_done()
 
 
-def send_to_sandbox(folder, te_ip='te.checkpoint.com', TE_API_KEY=None):
+def send_to_sandbox(folder, te_ip='te.checkpoint.com', TE_API_KEY=None, images=None):
     files_to_check = os.listdir(folder)
-    te_response_folder = "TE_FOLDER_" + time.strftime('%Y%m%dT%H%M%S')
+    te_response_folder = "TE_FOLDER_" + folder.split(LOCAL_STORE + '\\')[1]
 
     url = "https://{}/tecloud/api/v1/file/".format(te_ip)
     te_work = queue.Queue()  # Queues files to SB
@@ -535,7 +551,7 @@ def send_to_sandbox(folder, te_ip='te.checkpoint.com', TE_API_KEY=None):
                 logging.info("We need to check {} files".format(len(files_to_check)))
                 for file in files_to_check:
                     file_path = os.path.join(folder, file)
-                    te_work.put([url, file, file_path, te_work, te_response_folder, TE_API_KEY])
+                    te_work.put([url, file, file_path, te_work, te_response_folder, TE_API_KEY, images])
                     queued += 1
                     if queued >= len(files_to_check):
                         logging.info('Queued requested number of files')
@@ -568,16 +584,16 @@ def get_file_size(upstream):
 
 
 if __name__ == '__main__':
-    # numfiles = int(input("Number of files to search for[100]: ") or "100")  # default 100 files
-    # VT_API_KEY = str(input("Enter VT API KEY: ") or '')
-    # MAGIC = str(input('Enter magic search string or use default: ') or "(microsoft:clean symantec:clean kaspersky:clean bitdefender:clean positives:4+ positives:10-) AND ((type:doc) OR (type:pdf) OR (type:peexe))")
+    numfiles = int(input("Number of files to search for[100]: ") or "100")  # default 100 files
+    VT_API_KEY = str(input("Enter VT API KEY: ") or '')
+    MAGIC = str(input(
+        'Enter magic search string or use default: ') or "(microsoft:clean symantec:clean kaspersky:clean bitdefender:clean positives:4+ positives:10-) AND ((type:doc) OR (type:pdf) OR (type:peexe))")
     TE_API_KEY = str(
         input("Enter SandBlast TE Cloud API Key:  ") or "")
 
-    # if len(VT_API_KEY) == 0 or len(TE_API_KEY) == 0:
-    #     logging.error("API KEY invalid")
-    #     raise InvalidQueryError
-    # folder = download_files_from_VT(numfiles, VT_API_KEY, MAGIC)
-    folder = 'SAMPLEFILES\\20200917T110758'
-    TE_result = send_to_sandbox(folder, TE_API_KEY=TE_API_KEY)
+    if len(VT_API_KEY) == 0 or len(TE_API_KEY) == 0:
+        logging.error("API KEY invalid")
+        raise InvalidQueryError
+    folder = download_files_from_VT(numfiles, VT_API_KEY, MAGIC)
+    TE_result = send_to_sandbox(folder, TE_API_KEY=TE_API_KEY, images=None)
     # TE_result = send_to_sandbox(folder, te_ip='10.142.0.30:18194')
