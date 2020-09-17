@@ -276,20 +276,49 @@ SECONDS_TO_WAIT = 5
 
 def move_file_per_verdict(self, verdict):
     if verdict['severity'] == 4:  # critical
-        os.rename(self.file_path, self.output_folder + '\high' + self.file_name)
+        os.rename(self.file_path, self.output_folder + '\high\\' + self.file_name)
     if verdict['severity'] == 3:
-        os.rename(self.file_path, self.output_folder + '\medium' + self.file_name)
+        os.rename(self.file_path, self.output_folder + '\medium\\' + self.file_name)
 
 
 def parse_file_verdict(response):
     """
     parse and print the te verdict of current handled file
     """
-    verdict = {'verdict': response["response"][0]["te"]["combined_verdict"],
-               'severity': response["response"][0]["te"]['severity']
-               }
-    logging.info("te verdict is: {} for file {}".format(verdict, response['response'][0]['sha256']))
+    try:
+        verdict = {'verdict': response["response"][0]["te"]["combined_verdict"],
+                   'severity': response["response"][0]["te"]['severity']
+                   }
+        logging.info("te verdict is: {} for file {}".format(verdict, response['response'][0]['sha256']))
+
+    except:
+        verdict = {'verdict': response["response"]["te"]["combined_verdict"],
+                   'severity': response["response"]["te"].get('severity', None)}
+        logging.info("te verdict is: {} for file {}".format(verdict, response['response']['sha256']))
+
     return verdict
+
+
+def resolve_images_from_name(images):
+    result = []
+    for img in images:
+        if img.lower() == 'winxp':
+            result.append({
+                'id': 'e50e99f3-5963-4573-af9ee3f4750b55e2',
+                'revision': 1
+            })
+        elif img.lower() == 'win8':
+            result.append({
+                'id': '6c453c9b-20f7-471a-956c3198a868dc92',
+                'revision': 1
+            })
+        elif img.lower() == 'win10':
+            result.append({
+                'id': '10b4a9c6-e414-425c-ae8bfe4dd7b25244',
+                'revision': 1
+            })
+
+    return result
 
 
 class TE(object):
@@ -300,6 +329,8 @@ class TE(object):
     """
 
     def __init__(self, url, file_name, file_path, output_folder, TE_API_KEY):
+        self.images = None  # default win10 & win8
+        # self.images = ['winXP' , 'win8', 'win10']
         self.url = url
         self.file_name = file_name
         self.file_path = file_path
@@ -308,7 +339,7 @@ class TE(object):
         self.output_folder = output_folder
         self.sha1 = ""
         self.TE_API_KEY = TE_API_KEY
-        self.headers = {'Authorization': 'Bearer {}'.format(self.TE_API_KEY)} if TE_API_KEY is not None else ''
+        self.headers = {'Authorization': '{}'.format(self.TE_API_KEY)} if TE_API_KEY is not None else ''
 
     def create_response_data_file(self, response):
         """
@@ -330,7 +361,7 @@ class TE(object):
         response_j = json.loads('{}')
         label = False
         while label != "FOUND":
-            print("Sending TE Query request")
+            logging.debug("Sending TE Query request")
             response = requests.post(url=self.url + "query", data=data, verify=False, headers=self.headers)
             response_j = response.json()
             label = response_j["response"][0]["te"]["status"]["label"]
@@ -362,7 +393,7 @@ class TE(object):
            Otherwise, exit
         3. Save the upload/query response of found result in a file in the relevant folder
         """
-        upload_response = self.upload_file()
+        upload_response = self.upload_file() if self.TE_API_KEY is None else self.upload_file_cloud()
         logging.debug("Receiving TE Upload response")
         logging.info("Upload result: {}".format(upload_response["response"][0]["te"]["status"]["label"]))
         upload_return_code = upload_response["response"][0]["te"]["status"]["code"]
@@ -382,6 +413,71 @@ class TE(object):
         self.create_response_data_file(query_response)
         move_file_per_verdict(self, verdict)
         return True
+
+    def handle_file_cloud(self):
+        """
+        1. Upload the file to the appliance
+        2. If result is upload_success then query the file every SECONDS_TO_WAIT until receiving found result
+           Otherwise, if result is already found then continue
+           Otherwise, exit
+        3. Save the upload/query response of found result in a file in the relevant folder
+        """
+        upload_response = self.upload_file() if self.TE_API_KEY is None else self.upload_file_cloud()
+        logging.debug("Receiving TE Upload response")
+        logging.info("Upload result: {}".format(upload_response["response"]["te"]["status"]["label"]))
+        upload_return_code = upload_response["response"]["te"]["status"]["code"]
+        if upload_return_code == 1002:
+            logging.debug("upload response: {}".format(upload_response))
+            self.sha1 = upload_response["response"]["sha1"]
+            logging.debug("sha1: {}".format(self.sha1))
+            logging.info("Receiving TE Query-with-Found response")
+            query_response = self.query_file()
+        elif upload_return_code == 1001:
+            query_response = upload_response
+        elif upload_return_code == 1003:
+            return False
+        else:
+            logging.error(
+                "Upload resulted with failure: {}".format(upload_response["response"]["te"]["status"]["label"]))
+            return True
+        verdict = parse_file_verdict(query_response)
+        self.create_response_data_file(query_response)
+        move_file_per_verdict(self, verdict)
+        return True
+
+    def upload_file_cloud(self):
+        '''Will use xp and Win 10 as images and upload to cloud'''
+        if self.images is None:
+            images = [{
+                "id": "10b4a9c6-e414-425c-ae8b-fe4dd7b25244",
+                "revision": 1
+            },
+                {
+                    "id": 'e50e99f3-5963-4573-af9ee3f4750b55e2',
+                    "revision": 1
+                }]
+        else:
+            images = resolve_images_from_name(self.images)
+        request = {
+            "request": {
+                "file_name": self.file_name,
+                "file_type": "",
+                "features": ["te"],
+                "te": {
+                    "images": images,
+                    "reports": ["summary"]
+                }
+            }
+        }
+        data = json.dumps(request)
+        curr_file = {
+            'request': data,
+            'file': open(self.file_path, 'rb')
+        }
+        logging.debug("Sending TE Upload request")
+        response = requests.post(url=self.url + "upload", files=curr_file, verify=False, headers=self.headers)
+        response_j = response.json()
+        return response_j
 
 
 def create_out_folder(output_folder):
@@ -404,7 +500,14 @@ def te_worker(te_work):
         logging.info('Processing file %s', file)
 
         te = TE(url, file, file_path, te_response_folder, TE_API_KEY)
-        te.handle_file()
+
+        if TE_API_KEY is None:
+            te.handle_file()
+        else:
+            cloud_result = False
+            while not cloud_result:
+                cloud_result = te.handle_file_cloud()
+                time.sleep(3)
         logging.info('File analyzed %s', file)
     te_work.task_done()
 
@@ -464,11 +567,6 @@ def get_file_size(upstream):
     return file_size
 
 
-def get_verdict_from_te(self, filename, f_name):
-    file_verdict = send_to_sandbox(filename, f_name)
-    self.file_verdict = file_verdict
-
-
 if __name__ == '__main__':
     # numfiles = int(input("Number of files to search for[100]: ") or "100")  # default 100 files
     # VT_API_KEY = str(input("Enter VT API KEY: ") or '')
@@ -480,6 +578,6 @@ if __name__ == '__main__':
     #     logging.error("API KEY invalid")
     #     raise InvalidQueryError
     # folder = download_files_from_VT(numfiles, VT_API_KEY, MAGIC)
-    folder = 'SAMPLEFILES\\20200917T100647'
+    folder = 'SAMPLEFILES\\20200917T110758'
     TE_result = send_to_sandbox(folder, TE_API_KEY=TE_API_KEY)
     # TE_result = send_to_sandbox(folder, te_ip='10.142.0.30:18194')
