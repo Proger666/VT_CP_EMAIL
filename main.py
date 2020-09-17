@@ -42,7 +42,7 @@ import time
 TODAY_IS = time.strftime('%Y-%m-%dT00:00:00+')
 MAGIC = "(microsoft:clean symantec:clean kaspersky:clean bitdefender:clean positives:2+ positives:10-) AND ((type:doc AND tag:environ) OR (type:pdf AND tag:autoaction))"  ##This is a standard search but returns least results, +2 -10, and Docs looking for environemtn info, and PDF, trying to launch stuff. -- TKendrick
 # MAGIC = "(microsoft:clean symantec:clean kaspersky:clean bitdefender:clean positives:2+ positives:10-) AND ((type:doc AND tag:environ) OR (type:pdf))" ##This search is, +2 -10, and Docs looking for environemtn info, and PDF, but no tags. -- TKendrick
-# MAGIC = "(microsoft:clean symantec:clean kaspersky:clean bitdefender:clean positives:2+ positives:10-) AND ((type:doc) OR (type:pdf))" ##This search is, +2 -10, and Docs or PDF, but you dont know what file does what! Be careful. -- TKendrick
+# MAGIC = "(microsoft:clean symantec:clean kaspersky:clean bitdefender:clean positives:4+ positives:10-) AND ((type:doc) OR (type:pdf) OR (type:peexe))" ##This search is, +2 -10, and Docs or PDF, but you dont know what file does what! Be careful. -- TKendrick
 # MAGIC = "(microsoft:clean symantec:clean kaspersky:clean bitdefender:clean positives:2+ positives:10-) AND (type:doc AND tag:environ)" ##This is a standard search, +2 -10, and Docs looking for environemtn info. -- TKendrick
 # MAGIC = "(microsoft:clean symantec:clean kaspersky:clean bitdefender:clean  positives:2+ positives:10-) AND (type:pdf AND tag:autoaction)" ##This is a standard search, +2 -10, and PDF, trying to launch stuff -- TKendrick
 
@@ -171,7 +171,7 @@ def download_file(file_hash, VT_API_KEY, destination_file=None):
     return False
 
 
-def download_files_from_VT(numfiles, VT_API_KEY):
+def download_files_from_VT(numfiles, VT_API_KEY, MAGIC):
     """Download the top-n results of a given Intelligence search."""
     usage = 'usage: %prog -n # (specify a number of values to search for)'
     parser = optparse.OptionParser(
@@ -236,7 +236,7 @@ def download_files_from_VT(numfiles, VT_API_KEY):
                 next_page, hashes = get_matching_files(search, page=next_page)
             except InvalidQueryError as e:
                 logging.info('The search query provided is invalid... %s', e)
-                return
+                raise InvalidQueryError
             if hashes:
                 logging.info(
                     'Retrieved %s matching files in current page, queueing them',
@@ -274,12 +274,21 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 SECONDS_TO_WAIT = 5
 
 
+def move_file_per_verdict(self, verdict):
+    if verdict['severity'] == 4:  # critical
+        os.rename(self.file_path, self.output_folder + '\high' + self.file_name)
+    if verdict['severity'] == 3:
+        os.rename(self.file_path, self.output_folder + '\medium' + self.file_name)
+
+
 def parse_file_verdict(response):
     """
     parse and print the te verdict of current handled file
     """
-    verdict = response["response"][0]["te"]["combined_verdict"]
-    logging.info("te verdict is: {}".format(verdict))
+    verdict = {'verdict': response["response"][0]["te"]["combined_verdict"],
+               'severity': response["response"][0]["te"]['severity']
+               }
+    logging.info("te verdict is: {} for file {}".format(verdict, response['response'][0]['sha256']))
     return verdict
 
 
@@ -299,8 +308,7 @@ class TE(object):
         self.output_folder = output_folder
         self.sha1 = ""
         self.TE_API_KEY = TE_API_KEY
-        self.headers = {'Authorization:': self.TE_API_KEY} if TE_API_KEY is not None else ''
-        self.create_out_folder()
+        self.headers = {'Authorization': 'Bearer {}'.format(self.TE_API_KEY)} if TE_API_KEY is not None else ''
 
     def create_response_data_file(self, response):
         """
@@ -309,9 +317,8 @@ class TE(object):
 
         output_path = os.path.join(self.output_folder, self.file_name)
         output_path += ".response.txt"
-        with open(output_path, 'w') as file:
+        with open(output_path, 'w+') as file:
             json.dump(response, file)
-
 
     def query_file(self):
         """
@@ -342,7 +349,7 @@ class TE(object):
             'request': data,
             'file': open(self.file_path, 'rb')
         }
-        print("Sending TE Upload request")
+        logging.debug("Sending TE Upload request")
         response = requests.post(url=self.url + "upload", files=curr_file, verify=False, headers=self.headers)
         response_j = response.json()
         return response_j
@@ -368,25 +375,23 @@ class TE(object):
         elif upload_return_code == 1001:
             query_response = upload_response
         else:
-            logging.error("Upload resulted with failure: {}".format(upload_response["response"][0]["te"]["status"]["label"]))
-            return
+            logging.error(
+                "Upload resulted with failure: {}".format(upload_response["response"][0]["te"]["status"]["label"]))
+            return False
         verdict = parse_file_verdict(query_response)
         self.create_response_data_file(query_response)
-        self.move_mal_file(verdict)
+        move_file_per_verdict(self, verdict)
+        return True
 
 
-    def create_out_folder(self):
-        # check if folder exists
-        if not os.path.exists(self.output_folder):
-            os.mkdir(self.output_folder)
-        if not os.path.exists(self.output_folder + 'high'):
-            os.mkdir(self.output_folder + 'high')
-        if not os.path.exists(self.output_folder + 'medium'):
-            os.mkdir(self.output_folder + 'medium')
-
-    def move_mal_file(self, verdict):
-        if verdict == 'Malicious' :
-
+def create_out_folder(output_folder):
+    # check if folder exists
+    if not os.path.exists(output_folder):
+        os.mkdir(output_folder)
+    if not os.path.exists(output_folder + '\high'):
+        os.mkdir(output_folder + '\high')
+    if not os.path.exists(output_folder + '\medium'):
+        os.mkdir(output_folder + '\medium')
 
 
 def te_worker(te_work):
@@ -394,22 +399,14 @@ def te_worker(te_work):
         try:
             url, file, file_path, te_work, te_response_folder, TE_API_KEY = te_work.get(True, 3)
         except queue.Empty:
-            continue
+            break
 
         logging.info('Processing file %s', file)
 
         te = TE(url, file, file_path, te_response_folder, TE_API_KEY)
-        verdict = te.handle_file()
-        if verdict == 'malicious':
-            logging.debug("File malicious, filename: {}".format(file))
-            return False
-        elif verdict == 'benign':
-            logging.debug("File is benign, filename: {}".format(file))
-            te_work.task_done()
-            return True
-        else:
-            te_work.task_done()
-            return None
+        te.handle_file()
+        logging.info('File analyzed %s', file)
+    te_work.task_done()
 
 
 def send_to_sandbox(folder, te_ip='te.checkpoint.com', TE_API_KEY=None):
@@ -418,7 +415,7 @@ def send_to_sandbox(folder, te_ip='te.checkpoint.com', TE_API_KEY=None):
 
     url = "https://{}/tecloud/api/v1/file/".format(te_ip)
     te_work = queue.Queue()  # Queues files to SB
-
+    create_out_folder(te_response_folder)
     threads = []
     for unused_index in range(NUM_CONCURRENT_DOWNLOADS):
         thread = threading.Thread(target=te_worker, args=[te_work])
@@ -431,7 +428,6 @@ def send_to_sandbox(folder, te_ip='te.checkpoint.com', TE_API_KEY=None):
     wait = False
     while not end_process:
         try:
-            logging.info('Retrieving page of file hashes to download')
             if files_to_check:
                 logging.info("We need to check {} files".format(len(files_to_check)))
                 for file in files_to_check:
@@ -476,10 +472,14 @@ def get_verdict_from_te(self, filename, f_name):
 if __name__ == '__main__':
     # numfiles = int(input("Number of files to search for[100]: ") or "100")  # default 100 files
     # VT_API_KEY = str(input("Enter VT API KEY: ") or '')
-    # if len(VT_API_KEY) == 0:
-    #     logging.error("VT API KEY invalid")
+    # MAGIC = str(input('Enter magic search string or use default: ') or "(microsoft:clean symantec:clean kaspersky:clean bitdefender:clean positives:4+ positives:10-) AND ((type:doc) OR (type:pdf) OR (type:peexe))")
+    TE_API_KEY = str(
+        input("Enter SandBlast TE Cloud API Key:  ") or "")
+
+    # if len(VT_API_KEY) == 0 or len(TE_API_KEY) == 0:
+    #     logging.error("API KEY invalid")
     #     raise InvalidQueryError
-    # folder = download_files_from_VT(numfiles, VT_API_KEY)
-    # ''
-    folder = 'SAMPLEFILES\\20200917T065239'
-    TE_result = send_to_sandbox(folder, te_ip='10.142.0.30:18194')
+    # folder = download_files_from_VT(numfiles, VT_API_KEY, MAGIC)
+    folder = 'SAMPLEFILES\\20200917T100647'
+    TE_result = send_to_sandbox(folder, TE_API_KEY=TE_API_KEY)
+    # TE_result = send_to_sandbox(folder, te_ip='10.142.0.30:18194')
