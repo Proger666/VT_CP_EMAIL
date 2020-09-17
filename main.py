@@ -13,11 +13,10 @@ search and download the matching files individually.
 
 __author__ = 'emartinez@virustotal.com (Emiliano Martinez)'
 
-import urllib
 import queue
 from urllib.parse import urlencode
 
-from pip._vendor import requests
+from pip._vendor import requests, urllib3
 
 """
 Addition to search only for files from today using TODAY_IS variable. T Kendrick
@@ -48,7 +47,6 @@ MAGIC = "(microsoft:clean symantec:clean kaspersky:clean bitdefender:clean posit
 # MAGIC = "(microsoft:clean symantec:clean kaspersky:clean bitdefender:clean  positives:2+ positives:10-) AND (type:pdf AND tag:autoaction)" ##This is a standard search, +2 -10, and PDF, trying to launch stuff -- TKendrick
 
 
-API_KEY = ''
 INTELLIGENCE_SEARCH_URL = ('https://www.virustotal.com/intelligence/search/'
                            'programmatic/')
 INTELLIGENCE_DOWNLOAD_URL = ('https://www.virustotal.com/intelligence/download/'
@@ -120,7 +118,7 @@ def get_matching_files(search, page=None):
     response = None
     page = page or 'undefined'
     attempts = 0
-    parameters = {'query': search, 'apikey': API_KEY, 'page': page}
+    parameters = {'query': search, 'apikey': VT_API_KEY, 'page': page}
     data = urlencode(parameters)
     while attempts < 10:
         try:
@@ -146,18 +144,19 @@ def get_matching_files(search, page=None):
     return (next_page, hashes)
 
 
-def download_file(file_hash, destination_file=None):
+def download_file(file_hash, VT_API_KEY, destination_file=None):
     """Downloads the file with the given hash from Intelligence.
 
     Args:
       file_hash: either the md5, sha1 or sha256 hash of a file in VirusTotal.
       destination_file: full path where the given file should be stored.
+      VT_API_KEY: API key for virus total, you can get in profile settings.
 
     Returns:
       True if the download was successful, False if not.
     """
     destination_file = destination_file or file_hash
-    download_url = INTELLIGENCE_DOWNLOAD_URL % (file_hash, API_KEY)
+    download_url = INTELLIGENCE_DOWNLOAD_URL % (file_hash, VT_API_KEY)
     attempts = 0
     while attempts < 3:
         try:
@@ -172,7 +171,7 @@ def download_file(file_hash, destination_file=None):
     return False
 
 
-def main():
+def download_files_from_VT(numfiles, VT_API_KEY):
     """Download the top-n results of a given Intelligence search."""
     usage = 'usage: %prog -n # (specify a number of values to search for)'
     parser = optparse.OptionParser(
@@ -187,7 +186,6 @@ def main():
     search = search.strip().strip('\'')
     search = search + " " + MAGIC + " fs:" + TODAY_IS  ##Here is the action by TK to add the magic, and add the search only from today.  If you dont like the today, you can hard code, in format of fs:YYYY-MM-DDT00:00:00+ - see below for example, and switch line
     ##Example for above is search = search+" "+MAGIC+" fs:2019-12-25T00:00:00+"
-    numfiles = int(options.numfiles)
 
     if os.path.exists(search):
         with open(search, 'rb') as file_with_hashes:
@@ -200,10 +198,10 @@ def main():
     logging.info('* VirusTotal Intelligence search: %s', search)
     logging.info('* Number of files to download: %s', numfiles)
 
-    work = queue.Queue() # Queues files to download
+    work = queue.Queue()  # Queues files to download
     end_process = False
 
-    def worker():
+    def worker(VT_API_KEY):
         while not end_process:
             try:
                 sha256, folder = work.get(True, 3)
@@ -211,7 +209,7 @@ def main():
                 continue
             destination_file = os.path.join(folder, sha256)
             logging.info('Downloading file %s', sha256)
-            success = download_file(sha256, destination_file=destination_file)
+            success = download_file(sha256, VT_API_KEY, destination_file=destination_file)
             if success:
                 logging.info('%s download was successful', sha256)
             else:
@@ -220,7 +218,7 @@ def main():
 
     threads = []
     for unused_index in range(NUM_CONCURRENT_DOWNLOADS):
-        thread = threading.Thread(target=worker)
+        thread = threading.Thread(target=worker, args=[VT_API_KEY])
         thread.daemon = True
         thread.start()
         threads.append(thread)
@@ -262,6 +260,7 @@ def main():
                     if thread.is_alive():
                         thread.join()
                 logging.info('The downloaded files have been saved in %s', folder)
+                return folder
         except KeyboardInterrupt:
             end_process = True
             logging.info('Stopping the downloader, initiated downloads must finish')
@@ -269,21 +268,197 @@ def main():
                 if thread.is_alive():
                     thread.join()
 
-def send_to_sandbox(file_name, file_path):
-    input_file = file_path
-    te_response_folder = ".\\temp\\"
-    url = "https://te.checkpoint.com/tecloud/api/v1/file/"
-    API_KEY = 'TE_API_KEY_MpfEuzGvtIXZ4PCc9dzNnZGfmtlq0x8Ynwfddkbc'
-    te = TE(url, file_name, input_file, te_response_folder, API_KEY)
-    verdict = te.handle_file()
-    if verdict == 'malicious':
-        logger.debug("File not OK")
-        return False
-    elif verdict == 'benign':
-        logger.debug("File  OK")
-        return True
-    else:
-        return None
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+SECONDS_TO_WAIT = 5
+
+
+def parse_file_verdict(response):
+    """
+    parse and print the te verdict of current handled file
+    """
+    verdict = response["response"][0]["te"]["combined_verdict"]
+    logging.info("te verdict is: {}".format(verdict))
+    return verdict
+
+
+class TE(object):
+    """
+    this class gets a file as input. The methods will upload the file to TE, query until an answer is
+    received, and parse the response.
+    Notice that if TE should run separately, a separate parsing response method should be added.
+    """
+
+    def __init__(self, url, file_name, file_path, output_folder, TE_API_KEY):
+        self.url = url
+        self.file_name = file_name
+        self.file_path = file_path
+        self.upload_request = {"request": [{"features": ["te"]}]}
+        self.query_request = {"request": [{"sha1": "", "features": ["te"]}]}
+        self.output_folder = output_folder
+        self.sha1 = ""
+        self.TE_API_KEY = TE_API_KEY
+        self.headers = {'Authorization:': self.TE_API_KEY} if TE_API_KEY is not None else ''
+        self.create_out_folder()
+
+    def create_response_data_file(self, response):
+        """
+        upload the file to the appliance
+        """
+
+        output_path = os.path.join(self.output_folder, self.file_name)
+        output_path += ".response.txt"
+        with open(output_path, 'w') as file:
+            json.dump(response, file)
+
+
+    def query_file(self):
+        """
+        query the appliance for the file every SECONDS_TO_WAIT seconds
+        """
+        request = self.query_request
+        request['request'][0]['sha1'] = self.sha1
+        data = json.dumps(request)
+        response_j = json.loads('{}')
+        label = False
+        while label != "FOUND":
+            print("Sending TE Query request")
+            response = requests.post(url=self.url + "query", data=data, verify=False, headers=self.headers)
+            response_j = response.json()
+            label = response_j["response"][0]["te"]["status"]["label"]
+            if label == "FOUND":
+                break
+            time.sleep(SECONDS_TO_WAIT)
+        return response_j
+
+    def upload_file(self):
+        """
+        upload the file to the appliance
+        """
+        request = self.upload_request
+        data = json.dumps(request)
+        curr_file = {
+            'request': data,
+            'file': open(self.file_path, 'rb')
+        }
+        print("Sending TE Upload request")
+        response = requests.post(url=self.url + "upload", files=curr_file, verify=False, headers=self.headers)
+        response_j = response.json()
+        return response_j
+
+    def handle_file(self):
+        """
+        1. Upload the file to the appliance
+        2. If result is upload_success then query the file every SECONDS_TO_WAIT until receiving found result
+           Otherwise, if result is already found then continue
+           Otherwise, exit
+        3. Save the upload/query response of found result in a file in the relevant folder
+        """
+        upload_response = self.upload_file()
+        logging.debug("Receiving TE Upload response")
+        logging.info("Upload result: {}".format(upload_response["response"][0]["te"]["status"]["label"]))
+        upload_return_code = upload_response["response"][0]["te"]["status"]["code"]
+        if upload_return_code == 1002:
+            logging.debug("upload response: {}".format(upload_response))
+            self.sha1 = upload_response["response"][0]["sha1"]
+            logging.debug("sha1: {}".format(self.sha1))
+            logging.info("Receiving TE Query-with-Found response")
+            query_response = self.query_file()
+        elif upload_return_code == 1001:
+            query_response = upload_response
+        else:
+            logging.error("Upload resulted with failure: {}".format(upload_response["response"][0]["te"]["status"]["label"]))
+            return
+        verdict = parse_file_verdict(query_response)
+        self.create_response_data_file(query_response)
+        self.move_mal_file(verdict)
+
+
+    def create_out_folder(self):
+        # check if folder exists
+        if not os.path.exists(self.output_folder):
+            os.mkdir(self.output_folder)
+        if not os.path.exists(self.output_folder + 'high'):
+            os.mkdir(self.output_folder + 'high')
+        if not os.path.exists(self.output_folder + 'medium'):
+            os.mkdir(self.output_folder + 'medium')
+
+    def move_mal_file(self, verdict):
+        if verdict == 'Malicious' :
+
+
+
+def te_worker(te_work):
+    while True:
+        try:
+            url, file, file_path, te_work, te_response_folder, TE_API_KEY = te_work.get(True, 3)
+        except queue.Empty:
+            continue
+
+        logging.info('Processing file %s', file)
+
+        te = TE(url, file, file_path, te_response_folder, TE_API_KEY)
+        verdict = te.handle_file()
+        if verdict == 'malicious':
+            logging.debug("File malicious, filename: {}".format(file))
+            return False
+        elif verdict == 'benign':
+            logging.debug("File is benign, filename: {}".format(file))
+            te_work.task_done()
+            return True
+        else:
+            te_work.task_done()
+            return None
+
+
+def send_to_sandbox(folder, te_ip='te.checkpoint.com', TE_API_KEY=None):
+    files_to_check = os.listdir(folder)
+    te_response_folder = "TE_FOLDER_" + time.strftime('%Y%m%dT%H%M%S')
+
+    url = "https://{}/tecloud/api/v1/file/".format(te_ip)
+    te_work = queue.Queue()  # Queues files to SB
+
+    threads = []
+    for unused_index in range(NUM_CONCURRENT_DOWNLOADS):
+        thread = threading.Thread(target=te_worker, args=[te_work])
+        thread.daemon = True
+        thread.start()
+        threads.append(thread)
+
+    queued = 0
+    end_process = False
+    wait = False
+    while not end_process:
+        try:
+            logging.info('Retrieving page of file hashes to download')
+            if files_to_check:
+                logging.info("We need to check {} files".format(len(files_to_check)))
+                for file in files_to_check:
+                    file_path = os.path.join(folder, file)
+                    te_work.put([url, file, file_path, te_work, te_response_folder, TE_API_KEY])
+                    queued += 1
+                    if queued >= len(files_to_check):
+                        logging.info('Queued requested number of files')
+                        wait = True
+                        break
+            if wait:
+                logging.info('Waiting for queued files analyzing')
+                while te_work.qsize() > 0:
+                    time.sleep(5)
+                end_process = True
+                for thread in threads:
+                    if thread.is_alive():
+                        thread.join()
+                logging.info('The analyzed files have been processed from folder: %s ', folder)
+                return folder
+
+        except KeyboardInterrupt:
+            end_process = True
+            logging.info('Stopping the TE daemons')
+            for thread in threads:
+                if thread.is_alive():
+                    thread.join()
 
 
 def get_file_size(upstream):
@@ -293,13 +468,18 @@ def get_file_size(upstream):
     return file_size
 
 
-def get_verdict_from_te(self,filename, f_name):
+def get_verdict_from_te(self, filename, f_name):
     file_verdict = send_to_sandbox(filename, f_name)
     self.file_verdict = file_verdict
 
 
-
-
-
 if __name__ == '__main__':
-    main()
+    # numfiles = int(input("Number of files to search for[100]: ") or "100")  # default 100 files
+    # VT_API_KEY = str(input("Enter VT API KEY: ") or '')
+    # if len(VT_API_KEY) == 0:
+    #     logging.error("VT API KEY invalid")
+    #     raise InvalidQueryError
+    # folder = download_files_from_VT(numfiles, VT_API_KEY)
+    # ''
+    folder = 'SAMPLEFILES\\20200917T065239'
+    TE_result = send_to_sandbox(folder, te_ip='10.142.0.30:18194')
