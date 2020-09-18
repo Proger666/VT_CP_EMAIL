@@ -14,38 +14,22 @@ search and download the matching files individually.
 __author__ = 'emartinez@virustotal.com (Emiliano Martinez)'
 
 import queue
+import shutil
 from urllib.parse import urlencode
 
-from pip._vendor import requests, urllib3
-
-"""
-Addition to search only for files from today using TODAY_IS variable. T Kendrick
-In addition, added the MAGIC varliable, so that we can pre-configure the search
-*looking for doc and pdf (or just one type) 
-*with a tag (to make it more likely malicious and filter out some junk) 
-*for at least 2 positives, but under 10
-*not found by KAV, BitDefender or Microsoft  
-Just comment out which ever version of "MAGIC" you want to include. The lower in the list, the more results.
-
-"""
-
+import requests
 import json
 import logging
 import optparse
 import os
-import re
 import socket
 import sys
 import threading
 import time
 
-TODAY_IS = time.strftime('%Y-%m-%dT00:00:00+')
-MAGIC = "(microsoft:clean symantec:clean kaspersky:clean bitdefender:clean positives:2+ positives:10-) AND ((type:doc AND tag:environ) OR (type:pdf AND tag:autoaction))"  ##This is a standard search but returns least results, +2 -10, and Docs looking for environemtn info, and PDF, trying to launch stuff. -- TKendrick
-# MAGIC = "(microsoft:clean symantec:clean kaspersky:clean bitdefender:clean positives:2+ positives:10-) AND ((type:doc AND tag:environ) OR (type:pdf))" ##This search is, +2 -10, and Docs looking for environemtn info, and PDF, but no tags. -- TKendrick
-# MAGIC = "(microsoft:clean symantec:clean kaspersky:clean bitdefender:clean positives:4+ positives:10-) AND ((type:doc) OR (type:pdf) OR (type:peexe))" ##This search is, +2 -10, and Docs or PDF, but you dont know what file does what! Be careful. -- TKendrick
-# MAGIC = "(microsoft:clean symantec:clean kaspersky:clean bitdefender:clean positives:2+ positives:10-) AND (type:doc AND tag:environ)" ##This is a standard search, +2 -10, and Docs looking for environemtn info. -- TKendrick
-# MAGIC = "(microsoft:clean symantec:clean kaspersky:clean bitdefender:clean  positives:2+ positives:10-) AND (type:pdf AND tag:autoaction)" ##This is a standard search, +2 -10, and PDF, trying to launch stuff -- TKendrick
+import urllib3
 
+TODAY_IS = time.strftime('%Y-%m-%dT00:00:00+')
 
 INTELLIGENCE_SEARCH_URL = ('https://www.virustotal.com/intelligence/search/'
                            'programmatic/')
@@ -63,7 +47,8 @@ logging.basicConfig(level=LOGGING_LEVEL,
                     format='%(asctime)s %(levelname)-8s %(message)s',
                     datefmt='%Y-%m-%d %H:%M:%S',
                     stream=sys.stdout)
-f_global_time  = time.strftime('%Y%m%dT%H%M%S')
+f_global_time = time.strftime('%Y%m%dT%H%M%S')
+
 
 class Error(Exception):
     """Base-class for exceptions in this module."""
@@ -184,7 +169,11 @@ def download_files_from_VT(numfiles, VT_API_KEY, MAGIC):
     end_process = False
     search = ' '.join(args)
     search = search.strip().strip('\'')
-    search = search + " " + MAGIC + " fs:" + TODAY_IS  ##Here is the action by TK to add the magic, and add the search only from today.  If you dont like the today, you can hard code, in format of fs:YYYY-MM-DDT00:00:00+ - see below for example, and switch line
+    import re
+    WEEK_AGO = time.strftime("%Y-%m-%dT00:00:00+", time.localtime(time.time() - 1814400))
+    search = search + " " + MAGIC if re.search(r'\bfs:\b',
+                                               MAGIC) is not None else search + " " + MAGIC + " fs:" + WEEK_AGO
+    ##Here is the action by TK to add the magic, and add the search only from today.  If you dont like the today, you can hard code, in format of fs:YYYY-MM-DDT00:00:00+ - see below for example, and switch line
     ##Example for above is search = search+" "+MAGIC+" fs:2019-12-25T00:00:00+"
 
     if os.path.exists(search):
@@ -278,9 +267,14 @@ def move_file_per_verdict(self, verdict):
     if verdict['severity'] is None:
         return
     if verdict['severity'] >= 4:  # critical
-        os.rename(self.file_path, self.output_folder + '\high\\' + self.file_name)
+        mal_high = os.path.join(self.output_folder, 'high')
+        mal_high = os.path.join(mal_high, self.file_name)
+        shutil.move(self.file_path, mal_high)
+
     if verdict['severity'] == 3:
-        os.rename(self.file_path, self.output_folder + '\medium\\' + self.file_name)
+        mal_medium = os.path.join(self.output_folder, 'medium')
+        mal_medium = os.path.join(mal_medium, self.file_name)
+        shutil.move(self.file_path, mal_medium)
 
 
 def parse_file_verdict(response):
@@ -380,7 +374,11 @@ class TE(object):
         """
         request = self.upload_request
         data = json.dumps(request)
-        file = open(self.file_path, 'rb')
+        try:
+            file = open(self.file_path, 'rb')
+        except Exception:
+            logging.error("File not found {}".format(self.file_name))
+            return False
         curr_file = {
             'request': data,
             'file': file
@@ -399,6 +397,8 @@ class TE(object):
         3. Save the upload/query response of found result in a file in the relevant folder
         """
         upload_response = self.upload_file()
+        if not upload_response:
+            return False
         logging.debug("Receiving TE Upload response")
         logging.info("Upload result: {}".format(upload_response["response"][0]["te"]["status"]["label"]))
         upload_return_code = upload_response["response"][0]["te"]["status"]["code"]
@@ -494,6 +494,10 @@ class TE(object):
         logging.debug("Sending TE Upload request")
         try:
             response = requests.post(url=self.url + "upload", files=curr_file, verify=False, headers=self.headers)
+            if response.status_code == 403:
+                logging.error("!!!!! TE CLOUD API KEY MISSING!!!!!")
+
+                raise InvalidQueryError
             response_j = response.json()
         except Exception as e:
             logging.error("Failed to process file {}".format(self.file_name))
@@ -505,10 +509,12 @@ def create_out_folder(output_folder):
     # check if folder exists
     if not os.path.exists(output_folder):
         os.mkdir(output_folder)
-    if not os.path.exists(output_folder + '\high'):
-        os.mkdir(output_folder + '\high')
-    if not os.path.exists(output_folder + '\medium'):
-        os.mkdir(output_folder + '\medium')
+    mal_high = os.path.join(output_folder, 'high')
+    if not os.path.exists(mal_high):
+        os.mkdir(mal_high)
+    mal_medium = os.path.join(output_folder, 'medium')
+    if not os.path.exists(mal_medium):
+        os.mkdir(mal_medium)
 
 
 def te_worker(te_work):
@@ -521,17 +527,18 @@ def te_worker(te_work):
         logging.info('Processing file %s', file)
 
         te = TE(url, file, file_path, te_response_folder, TE_API_KEY, images)
-
-        if TE_API_KEY is None:
-            te.handle_file()
-        else:
-            cloud_result = False
-            while not cloud_result:
-                cloud_result = te.handle_file_cloud()
-                time.sleep(2)
-
+        try:
+            if TE_API_KEY is None:
+                te.handle_file()
+            else:
+                cloud_result = False
+                while not cloud_result:
+                    cloud_result = te.handle_file_cloud()
+                    time.sleep(2)
+        except ValueError:
+            logging.info("Found file less than threads")
         logging.info('File analyzed %s', file)
-    te_work.task_done()
+        te_work.task_done()
 
 
 def send_to_sandbox(folder, te_ip='te.checkpoint.com', TE_API_KEY=None, images=None):
@@ -593,13 +600,21 @@ if __name__ == '__main__':
     numfiles = int(input("Number of files to search for[100]: ") or "100")  # default 100 files
     VT_API_KEY = str(input("Enter VT API KEY: ") or '')
     MAGIC = str(input(
-        'Enter magic search string or use default: ') or "(microsoft:clean symantec:clean kaspersky:clean bitdefender:clean positives:4+ positives:10-) AND ((type:doc) OR (type:pdf) OR (type:peexe))")
-    TE_API_KEY = str(
-        input("Enter SandBlast TE Cloud API Key:  ") or "")
+        'Enter magic search string or use default: ') or '(microsoft:clean symantec:clean kaspersky:clean bitdefender:clean positives:2+ positives:10-) AND ((type:doc) AND (not name: "vbaProject.bin") AND (not name:".adp"))')
+    # Search for DOC:
+    # MAGIC = "(microsoft:clean symantec:clean kaspersky:clean bitdefender:clean positives:2+ positives:10-) AND ((type:doc AND tag:environ) AND not name: "vbaProject.bin" AND not name:".adp" )"
+    # Search for PDF:
+    # MAGIC = "(microsoft:clean symantec:clean kaspersky:clean bitdefender:clean  positives:5+ positives:10-) AND (type:pdf AND tag:autoaction OR tag:environ)"
+    # Search for EXE:
+    # MAGIC = "(microsoft:clean symantec:clean kaspersky:clean bitdefender:clean positives:5+ positives:10-) AND type:peexe AND (engines:"ransom" OR engines:"emotet" OR engines:"loki" OR engines:"netwalker" OR engines:"maze") AND not tag:corrupt"
 
-    if len(VT_API_KEY) == 0 or len(TE_API_KEY) == 0:
-        logging.error("API KEY invalid")
+    TE_API_KEY = str(
+        input("Enter SandBlast TE Cloud API Key:  ") or "TE_API_KEY_YLdkc2JJyXY44FrtavrambvVKGXJonRny4uAbwHN")
+
+    if len(VT_API_KEY) == 0:
+        logging.error("VT API KEY MISSING!")
         raise InvalidQueryError
+
     folder = download_files_from_VT(numfiles, VT_API_KEY, MAGIC)
-    TE_result = send_to_sandbox(folder, TE_API_KEY=TE_API_KEY, images=None)
-    # TE_result = send_to_sandbox(folder, te_ip='10.142.0.30:18194')
+    # TE_result = send_to_sandbox(folder, TE_API_KEY=TE_API_KEY, images=None)
+    TE_result = send_to_sandbox(folder, te_ip='10.142.0.30:18194')
